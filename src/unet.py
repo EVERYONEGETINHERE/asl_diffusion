@@ -40,13 +40,10 @@ class ResnetBlock(nn.Module):
     def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
         y = self.block1(x)
         t_emb = self.time_emb_mlp(time_embedding)
-        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1)
         if context_embedding is not None:
-            c_emb = self.context_emb_mlp(context_embedding)
-            c_emb = c_emb.unsqueeze(-1).unsqueeze(-1)
-            y = c_emb*y + t_emb
-        else:
-            y = y + t_emb
+            t_emb += self.context_emb_mlp(context_embedding)
+        t_emb = t_emb.unsqueeze(-1).unsqueeze(-1)
+        y = y + t_emb
         y = self.block2(y) + self.res(x)
         return y
 
@@ -165,6 +162,7 @@ class UNetUp(nn.Module):
     def forward(self, x: torch.Tensor, h: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
         y = self.upsample(x)
         y = torch.cat((y, h), dim=1)
+        #y = self.attblock(y)
         y = self.resblock(y, time_embedding, context_embedding)
         return y
 
