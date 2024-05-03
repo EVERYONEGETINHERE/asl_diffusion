@@ -29,30 +29,30 @@ class ASL_mnist(data.Dataset):
             image =self.transform(image)
         return image, label
 
-def show_dataset_images(dataset, transform, num_images=5, start_idx=0):
+def show_dataset_images(dataset, transform, num_images=24, start_idx=0):
     data = [dataset[i] for i in range(start_idx, start_idx+num_images)]
     imgs, labels = map(list, zip(*data))
     class_names = {idx: cls for cls, idx in dataset.class_to_idx.items()}
     
-    plt.figure(figsize=(12, 6))
+    #plt.figure(figsize=(12, 6))
     for i in range(num_images):
-      plt.subplot(num_images//5+1, 5, i + 1)
+      plt.subplot(num_images//6+1, 6, i + 1)
       plt.imshow(transform(imgs[i]))
-      plt.title(class_names[int(labels[i])])
-      plt.subplots_adjust(hspace=1.5)
+      plt.title(class_names[int(labels[i])], fontsize=10)
+      plt.subplots_adjust(hspace=0.5)
       plt.axis('off') 
                 
     plt.gcf().tight_layout()
 
-def numel(m: torch.nn.Module, only_trainable: bool = False):
+def numel(m: torch.nn.Module, only_trainable: bool = True):
     parameters = list(m.parameters())
     if only_trainable:
         parameters = [p for p in parameters if p.requires_grad]
     unique = {p.data_ptr(): p for p in parameters}.values()
     return sum(p.numel() for p in unique)
 
-def show_samples(diffusion_model, reverse_transform):
-    images = diffusion_model.sample()
+def show_samples(diffusion_model, reverse_transform, w=0.5):
+    images = diffusion_model.sample(w=w)
     for idx, img in enumerate(images):
         plt.subplot(len(images)//6+1, 6, idx+1)
         plt.imshow(reverse_transform(img))

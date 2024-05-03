@@ -66,27 +66,30 @@ class Diffusion:
             self.results['n_updates'] += 1
 
     @torch.inference_mode()
-    def sample(self, sample_j_and_z = False, return_history=False):
+    def sample(self, labels=None, w = 0.5):
         self.model.eval()
-        labels = [i for i in range(26) if (i != 9 and i != 25) or sample_j_and_z]
+        if labels is None:
+            labels = [i for i in range(26) if (i != 9 and i != 25)]      #every letter except J and Z
         
         images = torch.randn([len(labels), 1, 28, 28]).to(self.device)   #initial noise
         labels = torch.Tensor(labels).type(torch.int64).to(self.device)
 
         for i in range(self.num_timesteps-1, -1, -1):
             timesteps = torch.Tensor([i]).to(self.device).repeat(len(labels))
-            predicted_noise = self.model(images, timesteps, labels)
+            cond_predicted_noise = self.model(images, timesteps, labels)
+            uncond_predicted_noise = self.model(images, timesteps)
+            predicted_noise = (1+w)*cond_predicted_noise - w*uncond_predicted_noise
             
             noise = torch.randn_like(images) if i > 1 else 0
             images = (1/torch.sqrt(self.alphas[i]))*(images - predicted_noise*((1-self.alphas[i])/torch.sqrt(1 - self.alpha_cumprod[i]))) + torch.sqrt(self.betas[i])*noise
         return images
 
-    def save_model(self):
-        torch.save(self.model.state_dict(), "weights/model_state.pt")
+    def save_model_as(self, name: str = 'model_state'):
+        torch.save(self.model.state_dict(), 'weights/'+name+'.pt')
 
 
-    def load_model(self):
-        state_dict = torch.load("weights/model_state.pt")
+    def load_model_as(self, name: str = 'model_state'):
+        state_dict = torch.load('weights/'+name+'.pt')
         self.model.load_state_dict(state_dict)
 
 

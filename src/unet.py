@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 
 
 class Block(nn.Module):
@@ -47,124 +48,86 @@ class ResnetBlock(nn.Module):
         y = self.block2(y) + self.res(x)
         return y
 
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, in_channels):
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, channels: int, device='cuda'):
         super().__init__()
-        self.norm = nn.BatchNorm2d(in_channels)
-        self.query = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.key = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.value = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
+        self.channels = channels
+        half_channels = channels // 2
+        self.encodings = torch.exp(torch.arange(0., half_channels, 2, device=device) * -(math.log(10000.0) / half_channels))
+        
+    def forward(self, x: torch.Tensor):
+        device = x.device
+        B, C, H, W = x.shape
+        assert C == self.channels
+        half_C = C // 2
+        pos_w = torch.arange(0., W, device=device)
+        pos_h = torch.arange(0., H, device=device)
+        sin_inp_w = torch.einsum("i,j->ji", pos_w, self.encodings)
+        sin_inp_h = torch.einsum("i,j->ji", pos_h, self.encodings)
+        encodings_w = torch.cat((sin_inp_w.sin(), sin_inp_w.cos()), dim=0).unsqueeze(2)
+        encodings_h = torch.cat((sin_inp_h.sin(), sin_inp_h.cos()), dim=0).unsqueeze(1)
+        emb = torch.zeros((C, H, W), device=device)
+        emb[:half_C, :, :] = encodings_h
+        emb[half_C:C , :, :] = encodings_w
+        return emb.repeat(B, 1, 1, 1)
+
+class Attention(nn.Module):
+    def __init__(self, in_channels: int, num_heads: int):
+        super().__init__()
+        assert in_channels % num_heads == 0
         self.projection = torch.nn.Conv2d(in_channels,
                                         in_channels,
                                         kernel_size=1,
                                         stride=1,
-                                        padding=0)
+                                        padding=0,
+                                        bias=False)
+        self.norm = nn.BatchNorm2d(in_channels)
+        self.num_heads = num_heads
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        B, C, H, W = v.shape
+        head_dim = C//self.num_heads
+        q = q.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
+        v = v.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
+
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.transpose(1, 2).view(B, C, H, W)
+        h = self.projection(h)
+        h = self.norm(h)
+        return h
+
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels: int, num_heads: int):
+        super().__init__()
+        assert in_channels % num_heads == 0
+        self.fused_qkv = torch.nn.Conv2d(in_channels,        # x -> (q, k, v) as a single vector 
+                                 in_channels*3,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.attention = Attention(in_channels, num_heads)
+        self.encodings = PositionalEncoding2D(in_channels)
+        self.encodings_mlp = nn.Sequential(
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.SiLU()
+        )
 
     def forward(self, x: torch.Tensor):
-        h = self.norm(x)
-        q = self.query(h)
-        k = self.key(h)
-        v = self.value(h)
-
-        B, C, H, W = q.shape
-        q = q.reshape(B, C, H*W)
-        k = k.reshape(B, C, H*W)
+        enc = self.encodings(x)
+        h = self.encodings_mlp(enc) + x
+        B, C, H, W = h.shape
+        qkv = self.fused_qkv(h)
+        #qkv = qkv.view(B, 3*C, H, W)
+        q, k, v = qkv.chunk(3, 1)
         
-        q = q.permute(0, 2, 1)              # -> (B, H*W, C)
-        scores = torch.bmm(q, k)            # (B, H*W, C) @ (B, C, H*W) -> (B, H*W, H*W)
-        scores = scores * (int(C)**(-0.5))  # normalization for unit std
-        scores = F.softmax(scores, dim=2)
-        
-        v = v.reshape(B, C, H*W)
-        scores = scores.permute(0, 2, 1)    # -> (B, H*W, H*W)
-        h = torch.bmm(v, scores)            # (B, C, H*W) @ (B, H*W, H*W) -> (B, C, H*W)
-        h = h.reshape(B, C, H, W)
-        h = self.projection(h)
+        h = self.attention(q, k, v)
         return x + h
 
-class Downsample(nn.Module):
-    def __init__(self,
-                 in_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels,
-                              in_channels,
-                              kernel_size=2,
-                              stride=2)
-    def forward(self, x: torch.Tensor):
-        return self.conv(x)
-
-class Upsample(nn.Module):
-    def __init__(self,
-                 in_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels,
-                              in_channels,
-                              kernel_size=3,
-                              stride=1,
-                              padding=1)
-    def forward(self, x):
-        h = F.interpolate(x, scale_factor=2)
-        return self.conv(h)
-
-class UNetDown(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 time_emb_dim: int,
-                 context_emb_dim: int):
-        super().__init__()
-        self.resblock = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
-        self.downsample = Downsample(out_channels)
-
-    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
-        h = self.resblock(x, time_embedding, context_embedding)
-        y = self.downsample(h)
-        return y, h
-
-class UNetMiddle(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 time_emb_dim: int,
-                 context_emb_dim: int):
-        super().__init__()
-        self.resblock1 = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
-        self.attblock = SelfAttentionBlock(out_channels)
-        self.resblock2 = ResnetBlock(out_channels, out_channels, time_emb_dim, context_emb_dim)
-    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
-        y = self.resblock1(x, time_embedding, context_embedding)
-        y = self.attblock(y)
-        y = self.resblock2(y, time_embedding, context_embedding)
-        return y
-
-class UNetUp(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 time_emb_dim: int,
-                 context_emb_dim: int):
-        super().__init__()
-        self.upsample = Upsample(in_channels)
-        self.resblock = ResnetBlock(in_channels+in_channels, out_channels, time_emb_dim, context_emb_dim)
-
-    def forward(self, x: torch.Tensor, h: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
-        y = self.upsample(x)
-        y = torch.cat((y, h), dim=1)
-        #y = self.attblock(y)
-        y = self.resblock(y, time_embedding, context_embedding)
-        return y
 
 class TimeEmbedding(nn.Module):
     def __init__(self,
@@ -195,25 +158,113 @@ class EmbeddingFC(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.fc(x.view(-1, self.emb_dim))
 
+class Downsample(nn.Module):
+    def __init__(self,
+                 in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels,
+                              in_channels,
+                              kernel_size=2,
+                              stride=2)
+    def forward(self, x: torch.Tensor):
+        return self.conv(x)
+
+class Upsample(nn.Module):
+    def __init__(self,
+                 in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels,
+                              in_channels,
+                              kernel_size=3,
+                              stride=1,
+                              padding=1)
+    def forward(self, x):
+        h = F.interpolate(x, scale_factor=2)
+        return self.conv(h)
+
+class UNetDown(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 time_emb_dim: int,
+                 context_emb_dim: int,
+                 num_heads: Optional[int] = None):
+        super().__init__()
+        self.resblock = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
+        if num_heads is not None:
+            self.attblock = SelfAttention(out_channels, num_heads)
+        else:
+            self.attblock = nn.Identity()
+        self.downsample = Downsample(out_channels)
+
+    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
+        h = self.resblock(x, time_embedding, context_embedding)
+        h = self.attblock(h)
+        y = self.downsample(h)
+        return y, h
+
+class UNetMiddle(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 time_emb_dim: int,
+                 context_emb_dim: int,
+                 num_heads: Optional[int] = None):
+        super().__init__()
+        self.resblock1 = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
+        if num_heads is not None:
+            self.attblock = SelfAttention(out_channels, num_heads)
+        else:
+            self.attblock = nn.Identity()
+        self.resblock2 = ResnetBlock(out_channels, out_channels, time_emb_dim, context_emb_dim)
+    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
+        y = self.resblock1(x, time_embedding, context_embedding)
+        y = self.attblock(y)
+        y = self.resblock2(y, time_embedding, context_embedding)
+        return y
+
+class UNetUp(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 time_emb_dim: int,
+                 context_emb_dim: int,
+                 num_heads: Optional[int] = None):
+        super().__init__()
+        self.upsample = Upsample(in_channels)
+        if num_heads is not None:
+            self.attblock = SelfAttention(in_channels+in_channels, num_heads)
+        else:
+            self.attblock = nn.Identity()
+        self.resblock = ResnetBlock(in_channels+in_channels, out_channels, time_emb_dim, context_emb_dim)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
+        y = self.upsample(x)
+        y = torch.cat((y, h), dim=1)
+        y = self.attblock(y)
+        y = self.resblock(y, time_embedding, context_embedding)
+        return y
+
 class UNet(nn.Module):
     def __init__(self,
                 dim: int = 28,
-                input_channels: int = 1,
-                channels: int = 4,
-                channel_mults = [1, 2, 4],
+                channels: int = 1,
+                channel_mults = [8, 16, 32],
                 time_emb_dim: int = 8,
                 n_classes: int = 26,
-                context_emb_dim = 8):
+                context_emb_dim: int = 12,
+                attention_heads = [None, None, None]):   #num of attention heads for down, middle and up passes
         super().__init__()
-        self.increase_depth = nn.Conv2d(input_channels,
-                              channels,
+        assert len(attention_heads)==3
+        self.increase_depth = nn.Conv2d(channels,
+                              channels*channel_mults[0],
                               kernel_size=3,
                               padding=1)
-        self.down_blocks = nn.ModuleList([UNetDown(channels*ch_in, channels*ch_out, time_emb_dim, context_emb_dim) for ch_in, ch_out in zip(channel_mults[:-1], channel_mults[1:])])
-        self.middle_block = UNetMiddle(channels*channel_mults[-1], channels*channel_mults[-1], time_emb_dim, context_emb_dim)
-        self.up_blocks = nn.ModuleList([UNetUp(channels*ch_in, channels*ch_out, time_emb_dim, context_emb_dim) for ch_in, ch_out in zip(channel_mults[:0:-1], channel_mults[-2::-1])])
-        self.decrease_depth = nn.Conv2d(channels,
-                              input_channels,
+        self.down_blocks = nn.ModuleList([UNetDown(channels*ch_in, channels*ch_out, time_emb_dim, context_emb_dim, attention_heads[0]) for ch_in, ch_out in zip(channel_mults[:-1], channel_mults[1:])])
+        self.middle_block = UNetMiddle(channels*channel_mults[-1], channels*channel_mults[-1], time_emb_dim, context_emb_dim, attention_heads[1])
+        self.up_blocks = nn.ModuleList([UNetUp(channels*ch_in, channels*ch_out, time_emb_dim, context_emb_dim, attention_heads[2]) for ch_in, ch_out in zip(channel_mults[:0:-1], channel_mults[-2::-1])])
+        self.decrease_depth = nn.Conv2d(channels*channel_mults[0],
+                              channels,
                               kernel_size=3,
                               padding=1)
             
@@ -233,7 +284,6 @@ class UNet(nn.Module):
             c = self.context_mlp(label)
         else:
             c = None
-        #c = None
         h_deque = []
         y = x
         y = self.increase_depth(y)
