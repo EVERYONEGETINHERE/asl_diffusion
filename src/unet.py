@@ -49,7 +49,7 @@ class ResnetBlock(nn.Module):
         return y
 
 class PositionalEncoding2D(nn.Module):
-    def __init__(self, channels: int, device='cuda'):
+    def __init__(self, channels: int, device = 'cuda'):
         super().__init__()
         self.channels = channels
         half_channels = channels // 2
@@ -57,6 +57,7 @@ class PositionalEncoding2D(nn.Module):
         
     def forward(self, x: torch.Tensor):
         device = x.device
+        self.encodings = self.encodings.to(device)
         B, C, H, W = x.shape
         assert C == self.channels
         half_C = C // 2
@@ -71,42 +72,16 @@ class PositionalEncoding2D(nn.Module):
         emb[half_C:C , :, :] = encodings_w
         return emb.repeat(B, 1, 1, 1)
 
-class Attention(nn.Module):
-    def __init__(self, in_channels: int, num_heads: int):
-        super().__init__()
-        assert in_channels % num_heads == 0
-        self.projection = torch.nn.Conv2d(in_channels,
-                                        in_channels,
-                                        kernel_size=1,
-                                        stride=1,
-                                        padding=0,
-                                        bias=False)
-        self.norm = nn.BatchNorm2d(in_channels)
-        self.num_heads = num_heads
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        B, C, H, W = v.shape
-        head_dim = C//self.num_heads
-        q = q.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, head_dim).transpose(1, 2)
-
-        h = F.scaled_dot_product_attention(q, k, v)
-        h = h.transpose(1, 2).view(B, C, H, W)
-        h = self.projection(h)
-        h = self.norm(h)
-        return h
-
 class SelfAttention(nn.Module):
     def __init__(self, in_channels: int, num_heads: int):
         super().__init__()
         assert in_channels % num_heads == 0
-        self.fused_qkv = torch.nn.Conv2d(in_channels,        # x -> (q, k, v) as a single vector 
-                                 in_channels*3,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.attention = Attention(in_channels, num_heads)
+        self.num_heads = num_heads
+        self.fused_qkv = nn.Conv2d(in_channels,        # x -> (q, k, v) as a single vector 
+                                   in_channels*3,
+                                   kernel_size=1,
+                                   stride=1,
+                                   padding=0)
         self.encodings = PositionalEncoding2D(in_channels)
         self.encodings_mlp = nn.Sequential(
             nn.Conv2d(in_channels, 
@@ -116,18 +91,96 @@ class SelfAttention(nn.Module):
                       padding=0),
             nn.SiLU()
         )
+        self.projection = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0,
+                                        bias=False)
+        self.norm = nn.BatchNorm2d(in_channels)
+        
 
     def forward(self, x: torch.Tensor):
         enc = self.encodings(x)
         h = self.encodings_mlp(enc) + x
         B, C, H, W = h.shape
         qkv = self.fused_qkv(h)
-        #qkv = qkv.view(B, 3*C, H, W)
+        qkv = qkv.view(B, 3*C, H*W)
         q, k, v = qkv.chunk(3, 1)
         
-        h = self.attention(q, k, v)
-        return x + h
+        head_dim = C//self.num_heads
+        q = q.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        k = k.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        v = v.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.transpose(2, 3)
+        if self.num_heads == 1:
+            h = h.view(B, C, H, W)
+        else:
+            h = h.reshape(B, C, H, W)
+        h = self.projection(h)
+        h = self.norm(h)
+        return h + x
 
+class CrossAttention(nn.Module):
+    def __init__(self, in_channels: int, num_heads: int):
+        super().__init__()
+        assert in_channels % num_heads == 0
+        self.num_heads = num_heads
+        self.query_key = nn.Conv2d(in_channels,            # x -> (q, k)
+                                   in_channels*2,
+                                   kernel_size=1,
+                                   stride=1,
+                                   padding=0)
+        self.value = nn.Conv2d(in_channels,            # h -> v
+                               in_channels,
+                               kernel_size=1,
+                               stride=1,
+                               padding=0)
+        self.encodings = PositionalEncoding2D(in_channels)
+        self.encodings_mlp_x = nn.Sequential(
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.SiLU()
+        )
+        self.encodings_mlp_h = nn.Sequential(
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0),
+            nn.SiLU()
+        )
+        self.projection = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0,
+                                        bias=False)
+        self.norm = nn.BatchNorm2d(in_channels)
+        
+    def forward(self, x: torch.Tensor, h: torch.Tensor):
+        B, C, H, W = h.shape
+        x_enc = x + self.encodings_mlp_x(self.encodings(x))
+        h_enc = h + self.encodings_mlp_h(self.encodings(h))
+        qk = self.query_key(x_enc).view(B, 2*C, H*W)
+        v = self.value(h_enc).view(B, C, H*W)
+        q, k = qk.chunk(2, 1)
+        head_dim = C//self.num_heads
+        q = q.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        k = k.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        v = v.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        y = F.scaled_dot_product_attention(q, k, v).transpose(2, 3)
+        if self.num_heads == 1:
+            y = y.view(B, C, H, W)
+        else:
+            y = y.reshape(B, C, H, W)
+        y = self.projection(y)
+        y = self.norm(y)
+        return y + h
 
 class TimeEmbedding(nn.Module):
     def __init__(self,
@@ -191,15 +244,13 @@ class UNetDown(nn.Module):
                  num_heads: Optional[int] = None):
         super().__init__()
         self.resblock = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
-        if num_heads is not None:
-            self.attblock = SelfAttention(out_channels, num_heads)
-        else:
-            self.attblock = nn.Identity()
+        self.attblock = SelfAttention(out_channels, num_heads) if num_heads is not None else None
         self.downsample = Downsample(out_channels)
 
     def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
         h = self.resblock(x, time_embedding, context_embedding)
-        h = self.attblock(h)
+        if self.attblock is not None:
+            h = self.attblock(h)
         y = self.downsample(h)
         return y, h
 
@@ -212,14 +263,12 @@ class UNetMiddle(nn.Module):
                  num_heads: Optional[int] = None):
         super().__init__()
         self.resblock1 = ResnetBlock(in_channels, out_channels, time_emb_dim, context_emb_dim)
-        if num_heads is not None:
-            self.attblock = SelfAttention(out_channels, num_heads)
-        else:
-            self.attblock = nn.Identity()
+        self.attblock = SelfAttention(out_channels, num_heads) if num_heads is not None else None
         self.resblock2 = ResnetBlock(out_channels, out_channels, time_emb_dim, context_emb_dim)
     def forward(self, x: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
         y = self.resblock1(x, time_embedding, context_embedding)
-        y = self.attblock(y)
+        if self.attblock is not None:
+            y = self.attblock(y)
         y = self.resblock2(y, time_embedding, context_embedding)
         return y
 
@@ -231,17 +280,16 @@ class UNetUp(nn.Module):
                  context_emb_dim: int,
                  num_heads: Optional[int] = None):
         super().__init__()
+            
         self.upsample = Upsample(in_channels)
-        if num_heads is not None:
-            self.attblock = SelfAttention(in_channels+in_channels, num_heads)
-        else:
-            self.attblock = nn.Identity()
+        self.attblock = CrossAttention(in_channels, num_heads) if num_heads is not None else None
         self.resblock = ResnetBlock(in_channels+in_channels, out_channels, time_emb_dim, context_emb_dim)
 
     def forward(self, x: torch.Tensor, h: torch.Tensor, time_embedding: torch.Tensor, context_embedding=None):
         y = self.upsample(x)
+        if self.attblock is not None:
+            y = self.attblock(y, h)
         y = torch.cat((y, h), dim=1)
-        y = self.attblock(y)
         y = self.resblock(y, time_embedding, context_embedding)
         return y
 
