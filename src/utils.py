@@ -51,13 +51,15 @@ def numel(m: torch.nn.Module, only_trainable: bool = True):
     unique = {p.data_ptr(): p for p in parameters}.values()
     return sum(p.numel() for p in unique)
 
-def show_samples(diffusion_model, reverse_transform, w=0.5):
+def show_samples(diffusion_model, reverse_transform, w=0.5, cmap=None, save_as=None):
     images = diffusion_model.sample(w=w)
     for idx, img in enumerate(images):
         plt.subplot(len(images)//6+1, 6, idx+1)
-        plt.imshow(reverse_transform(img))
+        plt.imshow(reverse_transform(img), cmap=cmap)
         plt.axis('off') 
     plt.gcf().tight_layout()
+    if save_as is not None:
+        plt.savefig(save_as)
     plt.show()
 
 
