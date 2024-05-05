@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 import math
 from typing import Optional
 
@@ -89,7 +90,12 @@ class SelfAttention(nn.Module):
                       kernel_size=1,
                       stride=1,
                       padding=0),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0)
         )
         self.projection = torch.nn.Conv2d(in_channels,
                                         in_channels,
@@ -104,20 +110,12 @@ class SelfAttention(nn.Module):
         enc = self.encodings(x)
         h = self.encodings_mlp(enc) + x
         B, C, H, W = h.shape
-        qkv = self.fused_qkv(h)
-        qkv = qkv.view(B, 3*C, H*W)
-        q, k, v = qkv.chunk(3, 1)
-        
-        head_dim = C//self.num_heads
-        q = q.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
-        k = k.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
-        v = v.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
+        qkv = self.fused_qkv(x).chunk(3, dim=1)   # -> to tuple (q, k, v)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h (x y) c", h=self.num_heads), qkv
+        )
         h = F.scaled_dot_product_attention(q, k, v)
-        h = h.transpose(2, 3)
-        if self.num_heads == 1:
-            h = h.view(B, C, H, W)
-        else:
-            h = h.reshape(B, C, H, W)
+        h = rearrange(h, "b h (x y) d -> b (h d) x y", x=H, y=W)
         h = self.projection(h)
         h = self.norm(h)
         return h + x
@@ -144,7 +142,12 @@ class CrossAttention(nn.Module):
                       kernel_size=1,
                       stride=1,
                       padding=0),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0)
         )
         self.encodings_mlp_h = nn.Sequential(
             nn.Conv2d(in_channels, 
@@ -152,7 +155,12 @@ class CrossAttention(nn.Module):
                       kernel_size=1,
                       stride=1,
                       padding=0),
-            nn.SiLU()
+            nn.SiLU(),
+            nn.Conv2d(in_channels, 
+                      in_channels,
+                      kernel_size=1,
+                      stride=1,
+                      padding=0)
         )
         self.projection = torch.nn.Conv2d(in_channels,
                                         in_channels,
@@ -166,18 +174,15 @@ class CrossAttention(nn.Module):
         B, C, H, W = h.shape
         x_enc = x + self.encodings_mlp_x(self.encodings(x))
         h_enc = h + self.encodings_mlp_h(self.encodings(h))
-        qk = self.query_key(x_enc).view(B, 2*C, H*W)
-        v = self.value(h_enc).view(B, C, H*W)
-        q, k = qk.chunk(2, 1)
-        head_dim = C//self.num_heads
-        q = q.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
-        k = k.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
-        v = v.view(B, self.num_heads, head_dim, -1).transpose(2, 3)
-        y = F.scaled_dot_product_attention(q, k, v).transpose(2, 3)
-        if self.num_heads == 1:
-            y = y.view(B, C, H, W)
-        else:
-            y = y.reshape(B, C, H, W)
+        qk = self.query_key(x_enc).chunk(2, 1)
+        v = self.value(h_enc)
+        qkv = qk + (v,)
+        q, k, v = map(
+            lambda t: rearrange(t, "b (h c) x y -> b h (x y) c", h=self.num_heads), qkv
+        )
+        
+        y = F.scaled_dot_product_attention(q, k, v)
+        y = rearrange(y, "b h (x y) d -> b (h d) x y", x=H, y=W)
         y = self.projection(y)
         y = self.norm(y)
         return y + h
